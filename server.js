@@ -1,4 +1,4 @@
-// server.js — continuous 24/7 FCM revive server
+// server.js — relentless continuous revive server
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -12,9 +12,10 @@ const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
 const FIREBASE_CONFIG_ENV = process.env.FIREBASE_CONFIG || '';
 const FIREBASE_CONFIG_BASE64 = process.env.FIREBASE_CONFIG_BASE64 || '';
 
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10); // default 3s
-// optional: treat device as offline only if last seen older than this (default 30s)
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10); // default 3s; set 30000 for 30s
 const LAST_SEEN_THRESHOLD_MS = parseInt(process.env.LAST_SEEN_THRESHOLD_MS || '30000', 10);
+const DEFAULT_FCM_SEND_TIMEOUT_MS = parseInt(process.env.FCM_SEND_TIMEOUT_MS || '8000', 10);
+const MAX_RSS_MB = parseInt(process.env.MAX_RSS_MB || '900', 10);
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 function warn(...a) { console.warn(new Date().toISOString(), ...a); }
@@ -122,7 +123,17 @@ connectedRef.on('value', snap => {
   log('[rtdb] .info/connected =', snap.val());
 });
 
-// ---- FCM helpers ----
+// memory watcher – exit if RSS too big so supervisor restarts clean
+setInterval(() => {
+  const rss = process.memoryUsage().rss;
+  const mb = Math.round(rss / 1024 / 1024);
+  if (mb > MAX_RSS_MB) {
+    errlog('[process] RSS', mb, 'MB > threshold', MAX_RSS_MB, 'MB - exiting to allow restart');
+    process.exit(1);
+  }
+}, 30 * 1000);
+
+// ---- FCM helpers (with timeout) ----
 async function getFcmTokenForDevice(deviceId) {
   try {
     const snap = await tokensRef.child(deviceId).once('value');
@@ -146,38 +157,42 @@ function buildFcmMessage(token, deviceId, attempt, type) {
 }
 
 async function sendFcm(token, deviceId, attempt, type) {
+  // timeout protect the SDK send
+  const msg = buildFcmMessage(token, deviceId, attempt, type);
+  const sendPromise = admin.messaging().send(msg);
   try {
-    const msg = buildFcmMessage(token, deviceId, attempt, type);
-    const res = await admin.messaging().send(msg);
+    const res = await Promise.race([
+      sendPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('FCM_SEND_TIMEOUT')), DEFAULT_FCM_SEND_TIMEOUT_MS))
+    ]);
     log('[fcm-send] SUCCESS', deviceId, type, typeof res === 'string' ? res : JSON.stringify(res));
     return { ok: true, res };
   } catch (err) {
+    if (err && err.message === 'FCM_SEND_TIMEOUT') {
+      errlog('[fcm-send] TIMEOUT', deviceId, type, `timeout=${DEFAULT_FCM_SEND_TIMEOUT_MS}ms`);
+      return { ok: false, err: { code: 'FCM_SEND_TIMEOUT', message: `send timeout ${DEFAULT_FCM_SEND_TIMEOUT_MS}ms` } };
+    }
     errlog('[fcm-send] ERROR', deviceId, type, err && (err.code || err.message || err));
     return { ok: false, err };
   }
 }
 
-// ---- Job logic (continuous) ----
+// ---- Job logic (relentless, with watchdog) ----
 function stopJobFor(deviceId) {
   const j = jobs.get(deviceId);
   if (!j) return;
   j.stopped = true;
-  if (j.interval) clearInterval(j.interval);
+  if (j.interval) { clearInterval(j.interval); j.interval = null; }
+  if (j.watchdog) { clearInterval(j.watchdog); j.watchdog = null; }
   jobs.delete(deviceId);
   log('[job] stopped', deviceId);
 }
 
 async function startJobFor(deviceId, statusVal = {}) {
   if (jobs.has(deviceId)) {
+    // already running; ensure it's active
     log('[job] already running for', deviceId);
     return;
-  }
-
-  // if statusVal.timestamp exists, ensure device was offline long enough (optional)
-  const lastSeen = statusVal.timestamp || 0;
-  if (lastSeen && (Date.now() - lastSeen) < LAST_SEEN_THRESHOLD_MS) {
-    log('[job] device', deviceId, 'reported offline but lastSeen < threshold; still starting since you requested continuous behavior');
-    // (we still start — keep this message for visibility)
   }
 
   let token = statusVal.fcmToken || await getFcmTokenForDevice(deviceId);
@@ -187,18 +202,27 @@ async function startJobFor(deviceId, statusVal = {}) {
   }
 
   log('[job] starting continuous revive job for', deviceId, 'token=', maskToken(token));
-  const job = { deviceId, token, interval: null, stopped: false, sending: false, lastAttempt: null };
+  const job = { deviceId, token, interval: null, watchdog: null, stopped: false, sending: false, lastAttempt: null, lastSuccess: null };
   jobs.set(deviceId, job);
 
+  // immediate first send (don't wait for first interval)
+  (async () => {
+    try {
+      job.lastAttempt = Date.now();
+      const r0 = await sendFcm(job.token, deviceId, job.lastAttempt, 'server_offline_ping');
+      if (r0.ok) job.lastSuccess = Date.now();
+    } catch(e) { errlog('[job] immediate send error', deviceId, e && (e.message || e)); }
+  })();
+
+  // main interval
   job.interval = setInterval(() => {
-    // avoid overlapping sends if previous send still in progress
     if (job.stopped) return clearInterval(job.interval);
-    if (job.sending) return;
+    if (job.sending) return; // avoid overlap
 
     (async () => {
       job.sending = true;
       try {
-        // refresh token each cycle (in case mobile updated token)
+        // refresh token
         const freshToken = await getFcmTokenForDevice(deviceId);
         if (!freshToken) {
           errlog('[job] token missing on refresh for', deviceId, '- stopping job');
@@ -210,9 +234,9 @@ async function startJobFor(deviceId, statusVal = {}) {
           job.token = freshToken;
         }
 
-        // check online state in DB
+        // check online state
         let snap;
-        try { snap = await statusRef.child(deviceId).once('value'); } catch (e) { warn('[job] status read failed for', deviceId, e && e.message); snap = null; }
+        try { snap = await statusRef.child(deviceId).once('value'); } catch (e) { warn('[job] status read failed', deviceId, e && e.message); snap = null; }
         const val = (snap && snap.val()) || {};
         if (val.online) {
           log('[job] device back online, stopping job for', deviceId);
@@ -223,10 +247,11 @@ async function startJobFor(deviceId, statusVal = {}) {
         job.lastAttempt = Date.now();
         const attemptId = String(job.lastAttempt);
         const r = await sendFcm(job.token, deviceId, attemptId, 'server_offline_ping');
-        if (!r.ok) {
+        if (r.ok) {
+          job.lastSuccess = Date.now();
+        } else {
           const code = r.err && (r.err.code || r.err.message || JSON.stringify(r.err));
           errlog('[job] sendFcm failed for', deviceId, 'code=', code);
-          // detect permanent invalid token -> remove and stop job
           const codeStr = String(code || '').toLowerCase();
           if (codeStr.includes('registration-token-not-registered') ||
               codeStr.includes('invalid-registration-token') ||
@@ -236,16 +261,41 @@ async function startJobFor(deviceId, statusVal = {}) {
             errlog('[job] token invalid for', deviceId, '- removing token and stopping job');
             try { await tokensRef.child(deviceId).remove(); } catch(e){ warn('[job] token remove failed', e && e.message); }
             stopJobFor(deviceId);
+            return;
           }
         }
       } catch (e) {
         errlog('[job] unexpected error for', deviceId, e && (e.stack || e.message || e));
-        // don't kill process; we'll retry next interval
       } finally {
         job.sending = false;
       }
     })();
   }, PING_INTERVAL_MS);
+
+  // watchdog: restart job if stuck/no progress
+  job.watchdog = setInterval(async () => {
+    try {
+      if (!jobs.has(deviceId)) { clearInterval(job.watchdog); return; }
+      const now = Date.now();
+      const lastAttemptAge = now - (job.lastAttempt || 0);
+      const lastSuccessAge = job.lastSuccess ? (now - job.lastSuccess) : null;
+
+      // Conditions to restart:
+      // 1) no attempts for > 2 * PING_INTERVAL_MS (possible hang), OR
+      // 2) attempts but no success for long (5 * PING_INTERVAL_MS)
+      if ((lastAttemptAge > (2 * PING_INTERVAL_MS)) ||
+          (lastSuccessAge !== null && lastSuccessAge > (5 * PING_INTERVAL_MS) && lastAttemptAge > (2 * PING_INTERVAL_MS))) {
+        warn('[watchdog] restarting job for', deviceId, 'lastAttemptAge=', lastAttemptAge, 'lastSuccessAge=', lastSuccessAge);
+        try { stopJobFor(deviceId); } catch(e){}
+        // restart after short delay
+        setTimeout(async () => {
+          const token2 = await getFcmTokenForDevice(deviceId);
+          if (token2) startJobFor(deviceId, { timestamp: Date.now(), fcmToken: token2 });
+          else warn('[watchdog] no token to restart job for', deviceId);
+        }, 500);
+      }
+    } catch (e) { warn('[watchdog] error for', deviceId, e && e.message); }
+  }, Math.max(5000, PING_INTERVAL_MS * 2));
 }
 
 // ---- Status watch (listener) ----
@@ -269,7 +319,7 @@ statusRef.on('child_added', snap => handleStatusChange(snap.key, snap.val() || {
 statusRef.on('child_changed', snap => handleStatusChange(snap.key, snap.val() || {}));
 statusRef.on('child_removed', snap => { if (jobs.has(snap.key)) stopJobFor(snap.key); });
 
-// ---- Recovery scan: every 2 minutes ensure offline devices have jobs ----
+// ---- Aggressive recovery scan: every 1 minute ensure offline devices have jobs ----
 setInterval(async () => {
   try {
     const snap = await statusRef.once('value');
@@ -278,7 +328,6 @@ setInterval(async () => {
     for (const [deviceId, val] of Object.entries(all)) {
       if (!val) continue;
       if (val.online) {
-        // if job exists but device online, ensure stopped
         if (jobs.has(deviceId)) stopJobFor(deviceId);
         continue;
       }
@@ -296,7 +345,7 @@ setInterval(async () => {
   } catch (e) {
     warn('[recovery] scan failed', e && e.message);
   }
-}, 2 * 60 * 1000);
+}, 60 * 1000);
 
 // ---- Express API ----
 const app = express();
@@ -309,7 +358,8 @@ app.get('/jobs', (req, res) => {
     deviceId: j.deviceId,
     tokenPreview: maskToken(j.token),
     stopped: !!j.stopped,
-    lastAttempt: j.lastAttempt ? new Date(j.lastAttempt).toISOString() : null
+    lastAttempt: j.lastAttempt ? new Date(j.lastAttempt).toISOString() : null,
+    lastSuccess: j.lastSuccess ? new Date(j.lastSuccess).toISOString() : null
   }));
   res.json({ ok: true, count: jobs.size, list });
 });
