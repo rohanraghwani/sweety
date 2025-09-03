@@ -1,4 +1,4 @@
-// server.js — relentless continuous revive server
+// server.js — relentless continuous revive server (with log-stall restart)
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -17,9 +17,20 @@ const LAST_SEEN_THRESHOLD_MS = parseInt(process.env.LAST_SEEN_THRESHOLD_MS || '3
 const DEFAULT_FCM_SEND_TIMEOUT_MS = parseInt(process.env.FCM_SEND_TIMEOUT_MS || '8000', 10);
 const MAX_RSS_MB = parseInt(process.env.MAX_RSS_MB || '900', 10);
 
-function log(...a) { console.log(new Date().toISOString(), ...a); }
-function warn(...a) { console.warn(new Date().toISOString(), ...a); }
-function errlog(...a) { console.error(new Date().toISOString(), ...a); }
+// --- LOG STALL DETECTION CONFIG (NEW) ---
+const LOG_STALL_THRESHOLD_MS = parseInt(process.env.LOG_STALL_THRESHOLD_MS || '60000', 10); // default 60s without logs -> restart
+const LOG_CHECK_INTERVAL_MS = parseInt(process.env.LOG_CHECK_INTERVAL_MS || '15000', 10); // how often to check for log stall
+
+// track last time any log was emitted
+let lastLogAt = Date.now();
+
+function isoNow() { return new Date().toISOString(); }
+
+// Wrapped logging functions which also update lastLogAt
+function updateLastLog() { lastLogAt = Date.now(); }
+function log(...a) { updateLastLog(); console.log(isoNow(), ...a); }
+function warn(...a) { updateLastLog(); console.warn(isoNow(), ...a); }
+function errlog(...a) { updateLastLog(); console.error(isoNow(), ...a); }
 
 function maskToken(t) { if (!t || typeof t !== 'string') return '<null>'; if (t.length <= 10) return t; return `${t.slice(0,4)}...${t.slice(-6)}`; }
 function tryParseJson(str) { if (!str || typeof str !== 'string') return null; try { return JSON.parse(str); } catch { return null; } }
@@ -108,9 +119,17 @@ const tokensRef = db.ref('fcmTokens');
 const jobs = new Map(); // deviceId -> job object
 
 // ---- process safety & diagnostics ----
-process.on('unhandledRejection', (r)=> errlog('[process] unhandledRejection', r && (r.stack||r)));
-process.on('uncaughtException', (e)=> errlog('[process] uncaughtException', e && (e.stack||e)));
+process.on('unhandledRejection', (r)=> {
+  errlog('[process] unhandledRejection', r && (r.stack||r));
+});
+process.on('uncaughtException', (e)=> {
+  errlog('[process] uncaughtException', e && (e.stack||e));
+  // let the log-stall monitor / supervisor handle restart; but exit explicitly to be safe
+  try { /* give a moment for logs to flush */ } catch(e) {}
+  setTimeout(() => process.exit(1), 200);
+});
 
+// periodic diagnostic of jobs
 setInterval(()=> {
   try {
     log('[diag] jobs.count=', jobs.size, 'jobs=', Array.from(jobs.keys()).slice(0,20));
@@ -123,7 +142,7 @@ connectedRef.on('value', snap => {
   log('[rtdb] .info/connected =', snap.val());
 });
 
-// memory watcher – exit if RSS too big so supervisor restarts clean
+// memory watcher – exit if RSS too big so supervisor restarts
 setInterval(() => {
   const rss = process.memoryUsage().rss;
   const mb = Math.round(rss / 1024 / 1024);
@@ -346,6 +365,28 @@ setInterval(async () => {
     warn('[recovery] scan failed', e && e.message);
   }
 }, 60 * 1000);
+
+// ---- LOG STALL MONITOR (NEW) ----
+// periodic checker to see if logs have "stalled" (no log activity)
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const age = now - lastLogAt;
+    if (age > LOG_STALL_THRESHOLD_MS) {
+      // final diagnostics before exit
+      const msg = `[log-stall] no logs for ${age}ms (threshold ${LOG_STALL_THRESHOLD_MS}ms). Exiting for supervisor to restart.`;
+      // use console.error directly as our wrapped errlog updates lastLogAt (we intentionally bypass updating lastLogAt here)
+      console.error(new Date().toISOString(), msg);
+      // attempt to flush stdout/stderr (best-effort)
+      try { if (process.stdout) process.stdout.write('', ()=>{}); if (process.stderr) process.stderr.write('', ()=>{}); } catch(e){}
+      // exit with non-zero so supervisor restarts
+      process.exit(2);
+    }
+  } catch (e) {
+    // logging problem inside monitor itself
+    try { console.error(new Date().toISOString(), '[log-stall] monitor error', e && e.message); } catch(_) {}
+  }
+}, Math.max(1000, LOG_CHECK_INTERVAL_MS)); // at least 1s
 
 // ---- Express API ----
 const app = express();
