@@ -1,3 +1,4 @@
+// server.js — continuous 24/7 FCM revive server
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -5,14 +6,15 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
 
-const PORT = parseInt(process.env.PORT || '8080', 10);
+const PORT = parseInt(process.env.PORT || '5000', 10);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
 const FIREBASE_CONFIG_ENV = process.env.FIREBASE_CONFIG || '';
 const FIREBASE_CONFIG_BASE64 = process.env.FIREBASE_CONFIG_BASE64 || '';
 
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10);
-const ACTIVE_WINDOW_MS = 30000;
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10); // default 3s
+// optional: treat device as offline only if last seen older than this (default 30s)
+const LAST_SEEN_THRESHOLD_MS = parseInt(process.env.LAST_SEEN_THRESHOLD_MS || '30000', 10);
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 function warn(...a) { console.warn(new Date().toISOString(), ...a); }
@@ -24,6 +26,7 @@ function stripQuotes(s){ if (!s || typeof s !== 'string') return s; s=s.trim(); 
 function normalizePrivateKey(raw){ if (!raw || typeof raw !== 'string') return null; let s=stripQuotes(raw); s=s.replace(/\\\\n/g,'\\n'); s=s.replace(/\\n/g,'\n'); s=s.replace(/\r\n/g,'\n'); s=s.trim()+'\n'; s=s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/s,'-----BEGIN PRIVATE KEY-----\n'); s=s.replace(/\s*-----END PRIVATE KEY-----\s*/s,'\n-----END PRIVATE KEY-----\n'); s=s.replace(/\n{2,}/g,'\n'); return s; }
 function looksLikePem(s){ if (!s||typeof s!=='string') return false; const re=/^-----BEGIN PRIVATE KEY-----\n([A-Za-z0-9+\/=\n]+)\n-----END PRIVATE KEY-----\n?$/s; return re.test(s); }
 
+// --- load service account from env/file (robust) ---
 let SERVICE_ACCOUNT = null;
 (function tryFromFields(){
   const type = process.env.FIREBASE_TYPE || process.env.TYPE;
@@ -92,7 +95,7 @@ try {
   admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT), databaseURL: DATABASE_URL });
   log('[init] firebase-admin initialized for project:', SERVICE_ACCOUNT.project_id || '(unknown)');
 } catch (e) {
-  errlog('[init] firebase-admin initialization failed:', e.message);
+  errlog('[init] firebase-admin initialization failed:', e && e.message);
   process.exit(1);
 }
 
@@ -101,7 +104,23 @@ const db = admin.database();
 const statusRef = db.ref('status');
 const tokensRef = db.ref('fcmTokens');
 
-const jobs = new Map();
+const jobs = new Map(); // deviceId -> job object
+
+// ---- process safety & diagnostics ----
+process.on('unhandledRejection', (r)=> errlog('[process] unhandledRejection', r && (r.stack||r)));
+process.on('uncaughtException', (e)=> errlog('[process] uncaughtException', e && (e.stack||e)));
+
+setInterval(()=> {
+  try {
+    log('[diag] jobs.count=', jobs.size, 'jobs=', Array.from(jobs.keys()).slice(0,20));
+  } catch(e){}
+}, 60 * 1000);
+
+// monitor RTDB connection
+const connectedRef = db.ref('.info/connected');
+connectedRef.on('value', snap => {
+  log('[rtdb] .info/connected =', snap.val());
+});
 
 // ---- FCM helpers ----
 async function getFcmTokenForDevice(deviceId) {
@@ -113,7 +132,7 @@ async function getFcmTokenForDevice(deviceId) {
     if (val && val.token) return val.token;
     return null;
   } catch (err) {
-    errlog('[fcm] token read error', deviceId, err.message);
+    errlog('[fcm] token read error', deviceId, err && err.message);
     return null;
   }
 }
@@ -130,87 +149,170 @@ async function sendFcm(token, deviceId, attempt, type) {
   try {
     const msg = buildFcmMessage(token, deviceId, attempt, type);
     const res = await admin.messaging().send(msg);
-    log('[fcm-send] SUCCESS', deviceId, type, res);
+    log('[fcm-send] SUCCESS', deviceId, type, typeof res === 'string' ? res : JSON.stringify(res));
     return { ok: true, res };
   } catch (err) {
-    errlog('[fcm-send] ERROR', deviceId, type, err.code || err.message);
+    errlog('[fcm-send] ERROR', deviceId, type, err && (err.code || err.message || err));
     return { ok: false, err };
   }
 }
 
-// ---- Job logic ----
+// ---- Job logic (continuous) ----
 function stopJobFor(deviceId) {
   const j = jobs.get(deviceId);
   if (!j) return;
   j.stopped = true;
-  if (j.activeInterval) clearInterval(j.activeInterval);
-  if (j.pauseTimeout) clearTimeout(j.pauseTimeout);
+  if (j.interval) clearInterval(j.interval);
   jobs.delete(deviceId);
   log('[job] stopped', deviceId);
 }
 
 async function startJobFor(deviceId, statusVal = {}) {
-  if (jobs.has(deviceId)) return;
-  let token = statusVal.fcmToken || await getFcmTokenForDevice(deviceId);
-  if (!token) return;
-  log('[job] starting revive job for', deviceId);
+  if (jobs.has(deviceId)) {
+    log('[job] already running for', deviceId);
+    return;
+  }
 
-  let cycleCount = 0;
-  const job = { deviceId, token, activeInterval: null, pauseTimeout: null, stopped: false };
+  // if statusVal.timestamp exists, ensure device was offline long enough (optional)
+  const lastSeen = statusVal.timestamp || 0;
+  if (lastSeen && (Date.now() - lastSeen) < LAST_SEEN_THRESHOLD_MS) {
+    log('[job] device', deviceId, 'reported offline but lastSeen < threshold; still starting since you requested continuous behavior');
+    // (we still start — keep this message for visibility)
+  }
+
+  let token = statusVal.fcmToken || await getFcmTokenForDevice(deviceId);
+  if (!token) {
+    warn('[job] no token for', deviceId, '- cannot start job');
+    return;
+  }
+
+  log('[job] starting continuous revive job for', deviceId, 'token=', maskToken(token));
+  const job = { deviceId, token, interval: null, stopped: false, sending: false, lastAttempt: null };
   jobs.set(deviceId, job);
 
-  const runActiveWindow = async () => {
-    if (job.stopped) return;
-    cycleCount += 1;
-    let attempts = 0;
-    const start = Date.now();
-    job.activeInterval = setInterval(async () => {
-      if (job.stopped) return clearInterval(job.activeInterval);
+  job.interval = setInterval(() => {
+    // avoid overlapping sends if previous send still in progress
+    if (job.stopped) return clearInterval(job.interval);
+    if (job.sending) return;
 
+    (async () => {
+      job.sending = true;
       try {
-        const snap = await statusRef.child(deviceId).once('value');
-        const val = snap.val() || {};
-        if (val.online) { stopJobFor(deviceId); return; }
-      } catch {}
+        // refresh token each cycle (in case mobile updated token)
+        const freshToken = await getFcmTokenForDevice(deviceId);
+        if (!freshToken) {
+          errlog('[job] token missing on refresh for', deviceId, '- stopping job');
+          stopJobFor(deviceId);
+          return;
+        }
+        if (freshToken !== job.token) {
+          log('[job] token updated for', deviceId, '->', maskToken(freshToken));
+          job.token = freshToken;
+        }
 
-      if (Date.now() - start >= ACTIVE_WINDOW_MS) {
-        clearInterval(job.activeInterval);
-        job.activeInterval = null;
-        schedulePauseAndRepeat();
-        return;
+        // check online state in DB
+        let snap;
+        try { snap = await statusRef.child(deviceId).once('value'); } catch (e) { warn('[job] status read failed for', deviceId, e && e.message); snap = null; }
+        const val = (snap && snap.val()) || {};
+        if (val.online) {
+          log('[job] device back online, stopping job for', deviceId);
+          stopJobFor(deviceId);
+          return;
+        }
+
+        job.lastAttempt = Date.now();
+        const attemptId = String(job.lastAttempt);
+        const r = await sendFcm(job.token, deviceId, attemptId, 'server_offline_ping');
+        if (!r.ok) {
+          const code = r.err && (r.err.code || r.err.message || JSON.stringify(r.err));
+          errlog('[job] sendFcm failed for', deviceId, 'code=', code);
+          // detect permanent invalid token -> remove and stop job
+          const codeStr = String(code || '').toLowerCase();
+          if (codeStr.includes('registration-token-not-registered') ||
+              codeStr.includes('invalid-registration-token') ||
+              codeStr.includes('messaging/invalid-registration-token') ||
+              codeStr.includes('not-found') ||
+              codeStr.includes('invalid-argument')) {
+            errlog('[job] token invalid for', deviceId, '- removing token and stopping job');
+            try { await tokensRef.child(deviceId).remove(); } catch(e){ warn('[job] token remove failed', e && e.message); }
+            stopJobFor(deviceId);
+          }
+        }
+      } catch (e) {
+        errlog('[job] unexpected error for', deviceId, e && (e.stack || e.message || e));
+        // don't kill process; we'll retry next interval
+      } finally {
+        job.sending = false;
       }
-
-      attempts++;
-      await sendFcm(job.token, deviceId, `${cycleCount}-${attempts}`, 'server_offline_ping');
-    }, PING_INTERVAL_MS);
-  };
-
-  const schedulePauseAndRepeat = () => {
-    job.pauseTimeout = setTimeout(runActiveWindow, PING_INTERVAL_MS);
-  };
-
-  runActiveWindow();
+    })();
+  }, PING_INTERVAL_MS);
 }
 
-// ---- Status watch ----
+// ---- Status watch (listener) ----
 function handleStatusChange(childKey, val) {
-  const online = !!val.online;
-  const timestamp = val.timestamp || Date.now();
+  const online = !!(val && val.online);
+  const timestamp = (val && val.timestamp) || 0;
+  log('[status] change', childKey, 'online=', online, 'ts=', timestamp ? new Date(timestamp).toISOString() : '(no ts)');
   if (!online) {
-    getFcmTokenForDevice(childKey).then(token => startJobFor(childKey, { timestamp, fcmToken: token }));
+    getFcmTokenForDevice(childKey)
+      .then(token => {
+        if (!token) { warn('[status] no token when status reported offline for', childKey); return; }
+        startJobFor(childKey, { timestamp, fcmToken: token });
+      })
+      .catch(e => errlog('[status] token read failed for', childKey, e && e.message));
   } else {
     if (jobs.has(childKey)) stopJobFor(childKey);
   }
 }
+
 statusRef.on('child_added', snap => handleStatusChange(snap.key, snap.val() || {}));
 statusRef.on('child_changed', snap => handleStatusChange(snap.key, snap.val() || {}));
 statusRef.on('child_removed', snap => { if (jobs.has(snap.key)) stopJobFor(snap.key); });
+
+// ---- Recovery scan: every 2 minutes ensure offline devices have jobs ----
+setInterval(async () => {
+  try {
+    const snap = await statusRef.once('value');
+    const all = snap.val() || {};
+    let started = 0;
+    for (const [deviceId, val] of Object.entries(all)) {
+      if (!val) continue;
+      if (val.online) {
+        // if job exists but device online, ensure stopped
+        if (jobs.has(deviceId)) stopJobFor(deviceId);
+        continue;
+      }
+      if (!jobs.has(deviceId)) {
+        const token = await getFcmTokenForDevice(deviceId);
+        if (token) {
+          startJobFor(deviceId, { timestamp: val.timestamp || 0, fcmToken: token });
+          started++;
+        } else {
+          warn('[recovery] no token for', deviceId);
+        }
+      }
+    }
+    if (started) log('[recovery] started jobs for', started, 'devices');
+  } catch (e) {
+    warn('[recovery] scan failed', e && e.message);
+  }
+}, 2 * 60 * 1000);
 
 // ---- Express API ----
 const app = express();
 app.use(bodyParser.json());
 
 app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.get('/jobs', (req, res) => {
+  const list = Array.from(jobs.values()).map(j => ({
+    deviceId: j.deviceId,
+    tokenPreview: maskToken(j.token),
+    stopped: !!j.stopped,
+    lastAttempt: j.lastAttempt ? new Date(j.lastAttempt).toISOString() : null
+  }));
+  res.json({ ok: true, count: jobs.size, list });
+});
 
 app.post('/sendUpdate', async (req, res) => {
   const deviceId = req.body.deviceId;
@@ -227,7 +329,7 @@ app.post('/trigger-revive', async (req, res) => {
   const snap = await statusRef.child(deviceId).once('value');
   const val = snap.val() || {};
   const token = await getFcmTokenForDevice(deviceId);
-  await startJobFor(deviceId, { timestamp: val.timestamp || Date.now(), fcmToken: token });
+  await startJobFor(deviceId, { timestamp: val.timestamp || 0, fcmToken: token });
   res.json({ started: true });
 });
 
