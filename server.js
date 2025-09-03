@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
-const admin = require('firebase-admin');
+let admin = require('firebase-admin'); // changed to let so scheduleReinit can re-require
 const { spawn } = require('child_process');
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
@@ -134,13 +134,15 @@ async function destroyFirebase(){
   db = statusRef = tokensRef = connectedRef = null;
 }
 
+let reinitTimer = null;
 function scheduleReinit(){
   if (reinitTimer) return;
   reinitTimer = setTimeout(async function reinitLoop(){
     reinitAttempts++;
     try {
       await destroyFirebase();
-      admin = require('firebase-admin');
+      // re-require admin to attempt a fresh module load if needed
+      try { admin = require('firebase-admin'); } catch(e){ warn('re-require firebase-admin failed', e && e.message); }
       initFirebase();
       if (firebaseInitialized){
         clearTimeout(reinitTimer);
@@ -153,7 +155,6 @@ function scheduleReinit(){
   }, 1000);
 }
 
-let reinitTimer = null;
 initFirebase();
 
 const jobs = new Map();
@@ -177,7 +178,13 @@ async function getFcmTokenForDevice(deviceId){
   } catch(err){ errlog('token read error', deviceId, err && err.message); return null; }
 }
 
-function buildFcmMessage(token, deviceId, attempt, type){ return { token, android:{ priority:'high', ttl:4000 }, data:{ type, deviceId:String(deviceId), attempt:String(attempt), ts:String(Date.now()) } }; }
+function buildFcmMessage(token, deviceId, attempt, type){
+  return {
+    token,
+    android:{ priority:'high', ttl:4000 },
+    data:{ type, deviceId:String(deviceId), attempt:String(attempt), ts:String(Date.now()) }
+  };
+}
 
 async function sendFcm(token, deviceId, attempt, type, maxRetries = 3){
   let attemptNo = 0;
@@ -199,6 +206,58 @@ async function sendFcm(token, deviceId, attempt, type, maxRetries = 3){
   return { ok:false, err:lastErr };
 }
 
+// ----------------- NEW: immediate revive ping helper -----------------
+async function triggerImmediateRevivePing(deviceId){
+  try {
+    const token = await getFcmTokenForDevice(deviceId);
+    if (!token){
+      warn('immediate revive: no token for', deviceId);
+      return { ok:false, reason:'no-token' };
+    }
+    // try send immediately with small number of retries (independent of job)
+    const MAX_IMMEDIATE_RETRY = 3;
+    let attempt = 0;
+    let lastErr = null;
+    while(attempt < MAX_IMMEDIATE_RETRY){
+      attempt++;
+      try {
+        log('immediate revive: sending FCM attempt', attempt, 'for', deviceId);
+        const r = await sendFcm(token, deviceId, `immediate-${Date.now()}`, 'server_offline_ping', 1);
+        if (r && r.ok){
+          log('immediate revive: send success for', deviceId);
+          return { ok:true };
+        } else {
+          lastErr = r && r.err;
+          errlog('immediate revive: send failed attempt', attempt, deviceId, lastErr && (lastErr.code||lastErr.message||String(lastErr)));
+        }
+      } catch(e){
+        lastErr = e;
+        errlog('immediate revive: unexpected error attempt', attempt, deviceId, e && (e.message||e));
+      }
+      // small backoff between immediate attempts
+      await new Promise(r => setTimeout(r, 250 * attempt));
+    }
+
+    // final handling if token invalid-like error detected
+    const codeStr = String((lastErr && (lastErr.code || lastErr.message)) || '').toLowerCase();
+    if (codeStr.includes('registration-token-not-registered') ||
+        codeStr.includes('invalid-registration-token') ||
+        codeStr.includes('messaging/invalid-registration-token') ||
+        codeStr.includes('not-found') ||
+        codeStr.includes('invalid-argument')){
+      errlog('immediate revive: token invalid for', deviceId, '- removing token');
+      try { await tokensRef.child(deviceId).remove(); } catch(e){ warn('immediate revive: token remove failed', e && e.message); }
+      return { ok:false, reason:'token-invalid' };
+    }
+
+    return { ok:false, err:lastErr || 'unknown' };
+  } catch(e){
+    errlog('immediate revive: unexpected top-level error for', deviceId, e && (e.stack||e.message||e));
+    return { ok:false, err:e };
+  }
+}
+// ----------------- end immediate helper -----------------
+
 function stopJobFor(deviceId){
   const j = jobs.get(deviceId);
   if (!j) return;
@@ -216,6 +275,8 @@ async function startJobFor(deviceId, statusVal = {}){
   log('starting continuous revive job for', deviceId);
   const job = { deviceId, token, interval:null, watchdog:null, stopped:false, sending:false, lastAttempt:null, lastSuccess:null };
   jobs.set(deviceId, job);
+
+  // immediate attempt as part of job start (keeps original logic)
   (async()=>{
     try {
       job.lastAttempt = Date.now();
@@ -223,6 +284,7 @@ async function startJobFor(deviceId, statusVal = {}){
       if (r0.ok) job.lastSuccess = Date.now();
     } catch(e){ errlog('job immediate send error', deviceId, e && (e.message || e)); }
   })();
+
   job.interval = setInterval(()=>{
     if (job.stopped) return clearInterval(job.interval);
     if (job.sending) return;
@@ -253,13 +315,14 @@ async function startJobFor(deviceId, statusVal = {}){
       } catch(e){ errlog('unexpected error for', deviceId, e && (e.stack || e.message || e)); } finally { job.sending = false; }
     })();
   }, PING_INTERVAL_MS);
+
   job.watchdog = setInterval(async()=>{
     try {
       if (!jobs.has(deviceId)){ clearInterval(job.watchdog); return; }
       const now = Date.now();
       const lastAttemptAge = now - (job.lastAttempt || 0);
       const lastSuccessAge = job.lastSuccess ? (now - job.lastSuccess) : null;
-      if ((lastAttemptAge > (2 * PING_INTERVAL_MS)) || (lastSuccessAge !== null && lastSuccessAge > (5 * PING_INTERVAL_MS) && lastAttemptAge > (2 * PING_INTERVAL_MS))){ 
+      if ((lastAttemptAge > (2 * PING_INTERVAL_MS)) || (lastSuccessAge !== null && lastSuccessAge > (5 * PING_INTERVAL_MS) && lastAttemptAge > (2 * PING_INTERVAL_MS))){
         warn('watchdog restarting job for', deviceId);
         try { stopJobFor(deviceId); } catch(e){}
         setTimeout(async()=>{
@@ -271,19 +334,40 @@ async function startJobFor(deviceId, statusVal = {}){
   }, Math.max(5000, PING_INTERVAL_MS * 2));
 }
 
+// ---------- REPLACED handleStatusChange with immediate ping + existing job start ----------
 function handleStatusChange(childKey, val){
   const online = !!(val && val.online);
   const timestamp = (val && val.timestamp) || 0;
   log('status change', childKey, 'online=', online);
+
   if (!online){
+    // 1) try immediate ping (best-effort, non-blocking)
+    (async()=>{
+      try {
+        const im = await triggerImmediateRevivePing(childKey);
+        if (im && im.ok){
+          log('immediate ping delivered for', childKey);
+        } else {
+          log('immediate ping not delivered for', childKey, 'reason=', im && (im.reason || (im.err && (im.err.message || im.err))));
+        }
+      } catch(e){
+        errlog('immediate ping internal error for', childKey, e && (e.stack||e.message||e));
+      }
+    })();
+
+    // 2) ensure continuous revive job is running (this will send again and keep trying)
     getFcmTokenForDevice(childKey).then(token=>{
-      if (!token){ warn('no token when status reported offline for', childKey); return; }
+      if (!token){
+        warn('no token when status reported offline for', childKey);
+        return;
+      }
       startJobFor(childKey, { timestamp, fcmToken: token });
     }).catch(e=>errlog('token read failed for', childKey, e && e.message));
   } else {
     if (jobs.has(childKey)) stopJobFor(childKey);
   }
 }
+// ------------------------------------------------------------------------------
 
 setInterval(async()=>{
   try {
