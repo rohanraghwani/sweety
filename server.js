@@ -1,6 +1,14 @@
 /**
- * server.js — robust env-driven WebSocket + Firebase RTDB + FCM revive logic
- * Paste this file in project root. Use .env recommended format (see README above).
+ * server.js — env-driven WebSocket + Firebase RTDB + FCM revive logic
+ * + DB watchers: when status/<id>.online === false => start revive job (3s ping, 30s active, 5min pause)
+ * - Stops when device becomes online.
+ *
+ * Usage:
+ *  - Put .env in project root (see recommended keys in comments above).
+ *  - npm install express body-parser ws firebase-admin dotenv
+ *  - node server.js
+ *
+ * Security: keep .env out of git.
  */
 
 require('dotenv').config();
@@ -18,9 +26,9 @@ const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
 const FIREBASE_CONFIG_ENV = process.env.FIREBASE_CONFIG || '';
 const FIREBASE_CONFIG_BASE64 = process.env.FIREBASE_CONFIG_BASE64 || '';
 
-const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10);
-const ACTIVE_WINDOW_MS = parseInt(process.env.ACTIVE_WINDOW_MS || String(30 * 1000), 10);
-const PAUSE_MS = parseInt(process.env.PAUSE_MS || String(3 * 60 * 1000), 10);
+const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || '3000', 10);      // send interval during active window
+const ACTIVE_WINDOW_MS = parseInt(process.env.ACTIVE_WINDOW_MS || String(30 * 1000), 10); // active window length
+const PAUSE_MS = parseInt(process.env.PAUSE_MS || String(5 * 60 * 1000), 10);     // pause after an active window (default 5min)
 const OFFLINE_AGG_MS = parseInt(process.env.OFFLINE_AGG_MS || '2000', 10);
 const ANDROID_TTL_MS = parseInt(process.env.ANDROID_TTL_MS || String(60 * 60 * 1000), 10);
 const MAX_CYCLES = parseInt(process.env.MAX_CYCLES || '0', 10); // 0 = infinite
@@ -40,64 +48,33 @@ function tryParseJson(str) {
   try { return JSON.parse(str); } catch (e) { return null; }
 }
 
-/* -------------------- PRIVATE KEY NORMALIZATION -------------------- */
-
+/* ---------- private key normalization helpers ---------- */
 function stripQuotes(s){
   if (!s || typeof s !== 'string') return s;
   s = s.trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1,-1);
-  }
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1,-1);
   return s;
 }
-
 function normalizePrivateKey(raw){
   if (!raw || typeof raw !== 'string') return null;
-  let s = raw;
-
-  s = stripQuotes(s);
-
-  // handle double-escaped backslashes like "\\n" -> "\n" then -> actual newline
-  s = s.replace(/\\\\n/g, '\\n');
-
-  // convert escaped newlines to real newlines
-  s = s.replace(/\\n/g, '\n');
-
-  // normalize CRLF
+  let s = stripQuotes(raw);
+  s = s.replace(/\\\\n/g, '\\n'); // double-escaped -> single-escaped
+  s = s.replace(/\\n/g, '\n');    // escaped newlines -> actual newlines
   s = s.replace(/\r\n/g, '\n');
-
-  // trim and ensure trailing newline
   s = s.trim() + '\n';
-
-  // if the PEM is collapsed into a single line (no newline chars inside),
-  // try to rewrap the body into 64-char lines.
-  if (s.indexOf('\n') === -1 || (!s.includes('-----BEGIN PRIVATE KEY-----') && s.includes('BEGIN PRIVATE KEY'))) {
-    // best-effort: try inserting header/footer
-    const header = '-----BEGIN PRIVATE KEY-----';
-    const footer = '-----END PRIVATE KEY-----';
-    const body = s.replace(/(-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\\n|\n)/g,'').trim();
-    if (body.length > 0) {
-      const wrapped = body.match(/.{1,64}/g).join('\n');
-      s = header + '\n' + wrapped + '\n' + footer + '\n';
-    }
-  }
-
-  // ensure header and footer lines
+  // ensure header/footer formatting
   s = s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/s, '-----BEGIN PRIVATE KEY-----\n');
   s = s.replace(/\s*-----END PRIVATE KEY-----\s*/s, '\n-----END PRIVATE KEY-----\n');
-  s = s.replace(/\n{2,}/g, '\n'); // collapse multiple blank lines
-
+  s = s.replace(/\n{2,}/g, '\n');
   return s;
 }
-
 function looksLikePem(s){
   if (!s || typeof s !== 'string') return false;
   const re = /^-----BEGIN PRIVATE KEY-----\n([A-Za-z0-9+\/=\n]+)\n-----END PRIVATE KEY-----\n?$/s;
   return re.test(s);
 }
 
-/* -------------------- load service account (multiple fallbacks) -------------------- */
-
+/* ---------- extract FIREBASE_CONFIG block from raw .env if necessary ---------- */
 function extractFirebaseConfigFromDotEnv(){
   try {
     const envPath = path.join(process.cwd(), '.env');
@@ -119,15 +96,13 @@ function extractFirebaseConfigFromDotEnv(){
     if (found === -1) return null;
     const jsonText = raw.slice(firstBrace, found + 1);
     return tryParseJson(jsonText) || tryParseJson(jsonText.replace(/\r?\n/g,'\\n')) || null;
-  } catch (e) {
-    log('[env-extract] error', e && e.message);
-    return null;
-  }
+  } catch (e) { log('[env-extract] error', e && e.message); return null; }
 }
 
+/* ---------- assemble service account (many fallbacks) ---------- */
 let SERVICE_ACCOUNT = null;
 
-// 1) Prefer explicit FIREBASE_* env fields
+// 1) prefer separate env fields
 (function tryFromFields(){
   const type = process.env.FIREBASE_TYPE || process.env.TYPE;
   const project_id = process.env.FIREBASE_PROJECT_ID || process.env.PROJECT_ID;
@@ -151,16 +126,11 @@ let SERVICE_ACCOUNT = null;
   }
 })();
 
-// 2) FIREBASE_CONFIG JSON string
+// 2) FIREBASE_CONFIG env JSON
 if (!SERVICE_ACCOUNT && FIREBASE_CONFIG_ENV) {
   const parsed = tryParseJson(FIREBASE_CONFIG_ENV) || tryParseJson(FIREBASE_CONFIG_ENV.replace(/\r?\n/g,'\\n'));
-  if (parsed) {
-    if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key);
-    SERVICE_ACCOUNT = parsed;
-    log('[init] loaded service account from FIREBASE_CONFIG env');
-  } else {
-    log('[init] FIREBASE_CONFIG present but could not parse JSON');
-  }
+  if (parsed) { if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key); SERVICE_ACCOUNT = parsed; log('[init] loaded from FIREBASE_CONFIG env'); }
+  else log('[init] FIREBASE_CONFIG present but could not parse JSON');
 }
 
 // 3) FIREBASE_CONFIG_BASE64
@@ -168,15 +138,12 @@ if (!SERVICE_ACCOUNT && FIREBASE_CONFIG_BASE64) {
   try {
     const raw = Buffer.from(FIREBASE_CONFIG_BASE64, 'base64').toString('utf8');
     const parsed = tryParseJson(raw) || tryParseJson(raw.replace(/\r?\n/g,'\\n'));
-    if (parsed) {
-      if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key);
-      SERVICE_ACCOUNT = parsed;
-      log('[init] loaded service account from FIREBASE_CONFIG_BASE64');
-    } else log('[init] FIREBASE_CONFIG_BASE64 present but not parseable');
+    if (parsed) { if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key); SERVICE_ACCOUNT = parsed; log('[init] loaded from FIREBASE_CONFIG_BASE64'); }
+    else log('[init] FIREBASE_CONFIG_BASE64 present but not parseable');
   } catch (e) { warn('[init] FIREBASE_CONFIG_BASE64 decode failed', e && e.message); }
 }
 
-// 4) SERVICE_ACCOUNT_PATH
+// 4) SERVICE_ACCOUNT_PATH JSON file
 if (!SERVICE_ACCOUNT && SERVICE_ACCOUNT_PATH) {
   try {
     const saPath = path.isAbsolute(SERVICE_ACCOUNT_PATH) ? SERVICE_ACCOUNT_PATH : path.join(process.cwd(), SERVICE_ACCOUNT_PATH);
@@ -189,16 +156,11 @@ if (!SERVICE_ACCOUNT && SERVICE_ACCOUNT_PATH) {
   } catch (e) { warn('[init] require SERVICE_ACCOUNT_PATH failed', e && e.message); }
 }
 
-// 5) Scan raw .env for FIREBASE_CONFIG block
+// 5) scan .env for FIREBASE_CONFIG block (rare)
 if (!SERVICE_ACCOUNT) {
   const parsed = extractFirebaseConfigFromDotEnv();
-  if (parsed) {
-    if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key);
-    SERVICE_ACCOUNT = parsed;
-    log('[init] loaded service account by scanning .env (multiline support)');
-  } else {
-    log('[init] No FIREBASE_CONFIG parsed from .env scan');
-  }
+  if (parsed) { if (parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key); SERVICE_ACCOUNT = parsed; log('[init] loaded by scanning .env'); }
+  else log('[init] No FIREBASE_CONFIG parsed from .env scan');
 }
 
 if (!SERVICE_ACCOUNT) {
@@ -211,47 +173,50 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// debug preview for key (do not print entire key)
+// quick debug preview (first 120 chars) — \n shown as literal for safety
 if (SERVICE_ACCOUNT.private_key) {
   const preview = SERVICE_ACCOUNT.private_key.slice(0,120).replace(/\n/g,'\\n');
   log('[init] private_key preview (first 120 chars, \\n shown):', preview + (SERVICE_ACCOUNT.private_key.length>120 ? '...' : ''));
-  log('[init] quick pem check ->', looksLikePem(SERVICE_ACCOUNT.private_key) ? 'ok' : 'failed (will still try init)');
+  log('[init] quick pem check ->', looksLikePem(SERVICE_ACCOUNT.private_key) ? 'ok' : 'failed (will try init but may error)');
 } else warn('[init] no private_key present in resolved service account');
 
 try {
-  admin.initializeApp({
-    credential: admin.credential.cert(SERVICE_ACCOUNT),
-    databaseURL: DATABASE_URL
-  });
+  admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT), databaseURL: DATABASE_URL });
   log('[init] firebase-admin initialized for project:', SERVICE_ACCOUNT.project_id || '(unknown)');
 } catch (e) {
   errlog('[init] firebase-admin initialization failed:');
-  if (e && e.stack) errlog(e.stack);
-  else errlog(e && e.message ? e.message : e);
+  if (e && e.stack) errlog(e.stack); else errlog(e && e.message ? e.message : e);
   process.exit(1);
 }
 
-/* -------------------- rest of server logic -------------------- */
-
+/* ---------- DB refs and maps ---------- */
 const db = admin.database();
 const statusRef = db.ref('status');
 const tokensRef = db.ref('fcmTokens');
 
-const clients = new Map();
-const wsBySocket = new Map();
-const jobs = new Map();
+const clients = new Map(); // deviceId -> ws
+const wsBySocket = new Map(); // ws -> deviceId
+const jobs = new Map(); // deviceId -> job object
 
+/* ---------- helper to read fcm token from DB (with logs) ---------- */
 async function getFcmTokenForDevice(deviceId) {
   try {
     const snap = await tokensRef.child(deviceId).once('value');
-    if (!snap.exists()) { log('[token-read]', deviceId, '=> no token'); return null; }
+    if (!snap.exists()) { log('[token-read]', deviceId, '=> no token found in DB'); return null; }
     const val = snap.val();
-    const token = (typeof val === 'string') ? val : (val && val.token) ? val.token : null;
-    if (token) log('[token-read]', deviceId, '=>', maskToken(token)); else log('[token-read]', deviceId, '=> token node exists but empty');
+    let token = null;
+    if (typeof val === 'string') token = val;
+    else if (val && val.token) token = val.token;
+    if (token) log('[token-read]', deviceId, '=> token found', maskToken(token));
+    else log('[token-read]', deviceId, '=> token node exists but no token field');
     return token;
-  } catch (err) { errlog('[fcm] token read error', deviceId, err && err.message); return null; }
+  } catch (err) {
+    errlog('[fcm] token read error', deviceId, err && err.message);
+    return null;
+  }
 }
 
+/* ---------- build & send FCM ---------- */
 function buildFcmMessage(token, deviceId, attempt) {
   return {
     token,
@@ -265,15 +230,16 @@ async function sendFcm(token, deviceId, attempt) {
   log('[fcm-send] attempting -> device=', deviceId, 'token=', maskToken(token), 'attempt=', attempt);
   try {
     const res = await admin.messaging().send(msg);
-    log('[fcm-send] SUCCESS ->', res);
+    log('[fcm-send] SUCCESS -> device=', deviceId, 'messageId=', res);
     return { ok: true, res };
   } catch (err) {
     const code = (err && (err.code || (err.errorInfo && err.errorInfo.code))) || (err && err.message) || 'unknown';
-    errlog('[fcm-send] ERROR -> device=', deviceId, 'code=', code);
+    errlog('[fcm-send] ERROR -> device=', deviceId, 'token=', maskToken(token), 'attempt=', attempt, 'code=', code);
     return { ok: false, err, code };
   }
 }
 
+/* ---------- revive job control ---------- */
 function stopJobFor(deviceId) {
   const j = jobs.get(deviceId);
   if (!j) { log('[job-stop] no job for', deviceId); return; }
@@ -286,10 +252,15 @@ function stopJobFor(deviceId) {
 
 async function startJobFor(deviceId, statusVal = {}) {
   if (jobs.has(deviceId)) { log('[job] already running for', deviceId); return; }
+
   let token = statusVal.fcmToken || null;
   if (!token) token = await getFcmTokenForDevice(deviceId);
+  else log('[job] token provided from statusVal for', deviceId, maskToken(token));
+
   if (!token) { log('[job] NO TOKEN -> skipping revive job for', deviceId); return; }
-  log('[job] starting revive job for', deviceId, 'token=', maskToken(token));
+
+  log('[job] starting revive job for', deviceId, 'using token', maskToken(token));
+
   let cycleCount = 0;
   const job = { deviceId, token, activeInterval: null, pauseTimeout: null, stopped: false };
   jobs.set(deviceId, job);
@@ -301,13 +272,14 @@ async function startJobFor(deviceId, statusVal = {}) {
     const myCycle = cycleCount;
     log('[job] active window start', deviceId, 'cycle', myCycle);
 
+    // immediate send
     attempts += 1;
     const s0 = await sendFcm(job.token, deviceId, `${myCycle}-${attempts}`);
     if (!s0.ok) {
       const c0 = s0.code || (s0.err && s0.err.code);
       if (c0 === 'messaging/registration-token-not-registered' || c0 === 'messaging/invalid-registration-token') {
-        warn('[job] token invalid -> removing from DB and stopping job for', deviceId);
-        try { await tokensRef.child(deviceId).remove(); log('[db] removed invalid token for', deviceId); } catch (e) { warn('[db] remove failed', e && e.message); }
+        warn('[job] initial send token invalid -> removing token from DB and stopping job for', deviceId);
+        try { await tokensRef.child(deviceId).remove(); log('[db] removed invalid token for', deviceId); } catch (e) { warn('[db] failed to remove token for', deviceId, e && e.message); }
         stopJobFor(deviceId); return;
       }
     }
@@ -315,16 +287,22 @@ async function startJobFor(deviceId, statusVal = {}) {
     const start = Date.now();
     job.activeInterval = setInterval(async () => {
       if (job.stopped) { clearInterval(job.activeInterval); job.activeInterval = null; return; }
+
+      // check live status: if device became online, stop immediately
       try {
         const snap = await statusRef.child(deviceId).once('value');
         const val = snap.val() || {};
-        if (val.online) { log('[job] device came online -> stopping job for', deviceId); stopJobFor(deviceId); return; }
+        if (val.online) {
+          log('[job] device came online during active window -> stopping job for', deviceId, 'uniqueid=', val.uniqueid || '(none)');
+          stopJobFor(deviceId); return;
+        }
       } catch (e) { errlog('[job] status read err', deviceId, e && e.message); }
 
       if (Date.now() - start >= ACTIVE_WINDOW_MS) {
         clearInterval(job.activeInterval); job.activeInterval = null;
-        log('[job] active window ended for', deviceId);
-        schedulePauseAndRepeat(); return;
+        log('[job] active window ended for', deviceId, 'cycle', myCycle);
+        schedulePauseAndRepeat();
+        return;
       }
 
       attempts += 1;
@@ -332,36 +310,45 @@ async function startJobFor(deviceId, statusVal = {}) {
       if (!sent.ok) {
         const c = sent.code || (sent.err && sent.err.code);
         if (c === 'messaging/registration-token-not-registered' || c === 'messaging/invalid-registration-token') {
-          warn('[job] invalid token -> removing and stopping job', deviceId);
-          try { await tokensRef.child(deviceId).remove(); log('[db] removed invalid token for', deviceId); } catch (e) { warn('[db] remove failed', e && e.message); }
+          warn('[job] invalid token detected -> removing token and stopping job for', deviceId, 'code=', c);
+          try { await tokensRef.child(deviceId).remove(); log('[db] removed invalid token for', deviceId); } catch (e) { warn('[db] failed to remove token for', deviceId, e && e.message); }
           stopJobFor(deviceId); return;
-        } else warn('[job] non-token error while sending FCM', deviceId, c);
+        } else {
+          warn('[job] non-token error while sending FCM to', deviceId, c);
+        }
       }
     }, PING_INTERVAL_MS);
   };
 
   const schedulePauseAndRepeat = () => {
-    if (MAX_CYCLES > 0 && cycleCount >= MAX_CYCLES) { log('[job] MAX_CYCLES reached -> stop', deviceId); stopJobFor(deviceId); return; }
-    log('[job] pausing', PAUSE_MS, 'ms for', deviceId);
+    if (MAX_CYCLES > 0 && cycleCount >= MAX_CYCLES) { log('[job] MAX_CYCLES reached -> stop for', deviceId); stopJobFor(deviceId); return; }
+    log('[job] pausing', PAUSE_MS, 'ms for', deviceId, 'after cycle', cycleCount);
     job.pauseTimeout = setTimeout(async () => {
       try {
         const snap = await statusRef.child(deviceId).once('value');
-        if (snap.exists() && snap.val().online) { log('[job] device became online -> stop', deviceId); stopJobFor(deviceId); return; }
+        if (snap.exists() && snap.val().online) { log('[job] device became online during pause -> stopping job for', deviceId); stopJobFor(deviceId); return; }
         runActiveWindow().catch(e => { errlog('[job] runActiveWindow err', e && e.message); stopJobFor(deviceId); });
-      } catch (e) { errlog('[job] check err', e && e.message); runActiveWindow().catch(() => stopJobFor(deviceId)); }
+      } catch (e) {
+        errlog('[job] check err before next cycle for', deviceId, e && e.message);
+        runActiveWindow().catch(err => { errlog('[job] fallback err', err && err.message); stopJobFor(deviceId); });
+      }
     }, PAUSE_MS);
   };
 
+  // offline aggregation logic: if status timestamp is very fresh, wait OFFLINE_AGG_MS
   const offlineSince = Date.now() - (statusVal.timestamp || 0);
   if (offlineSince < OFFLINE_AGG_MS) {
     const wait = OFFLINE_AGG_MS - offlineSince;
-    log('[job] aggregating for', wait, 'ms before starting', deviceId);
-    job.pauseTimeout = setTimeout(() => { runActiveWindow().catch(e => { errlog('[job] initial run err', e && e.message); stopJobFor(deviceId); }); }, wait);
-  } else runActiveWindow().catch(e => { errlog('[job] initial run err', e && e.message); stopJobFor(deviceId); });
+    log('[job] aggregating for', wait, 'ms before starting job for', deviceId);
+    job.pauseTimeout = setTimeout(() => {
+      runActiveWindow().catch(e => { errlog('[job] initial run err', e && e.message); stopJobFor(deviceId); });
+    }, wait);
+  } else {
+    runActiveWindow().catch(e => { errlog('[job] initial run err', e && e.message); stopJobFor(deviceId); });
+  }
 }
 
-/* -------------------- WebSocket server -------------------- */
-
+/* ---------- WebSocket server (unchanged) ---------- */
 const wss = new WebSocket.Server({ port: PORT }, () => log('[ws] listening on', PORT));
 
 wss.on('connection', (ws, req) => {
@@ -425,6 +412,53 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => { warn('[ws] error from', remote, err && err.message ? err.message : err); });
 });
 
+/* ---------- watch Realtime DB status nodes and trigger jobs ---------- */
+
+// when a status child is added or changes, react accordingly
+function handleStatusChange(childKey, val) {
+  try {
+    const online = !!(val && val.online);
+    const timestamp = val && val.timestamp ? val.timestamp : Date.now();
+    const uniqueid = val && val.uniqueid ? val.uniqueid : childKey;
+
+    if (!online) {
+      // device currently offline -> start revive job (if not already running)
+      log('[db-watch] status offline for', childKey, 'uniqueid=', uniqueid, 'timestamp=', timestamp);
+      // pass timestamp and token (if available) as hint
+      getFcmTokenForDevice(childKey).then(token => startJobFor(childKey, { timestamp, fcmToken: token })).catch(e => errlog('[db-watch] startJobFor err', e && e.message));
+    } else {
+      // device is online -> stop job if present
+      log('[db-watch] status online for', childKey, '-> stopping any revive job');
+      if (jobs.has(childKey)) stopJobFor(childKey);
+    }
+  } catch (e) { errlog('[db-watch] handleStatusChange error', e && e.message); }
+}
+
+// initial scan: find all status nodes and start jobs for offline ones
+async function initialStatusScan() {
+  try {
+    const snap = await statusRef.once('value');
+    const obj = snap.val() || {};
+    Object.keys(obj).forEach(k => {
+      const val = obj[k] || {};
+      if (!val.online) {
+        log('[init-scan] offline at startup -> starting job for', k);
+        getFcmTokenForDevice(k).then(token => startJobFor(k, { timestamp: val.timestamp || Date.now(), fcmToken: token })).catch(e => errlog('[init-scan] startJobFor err', e && e.message));
+      }
+    });
+  } catch (e) { errlog('[init-scan] failed', e && e.message); }
+}
+
+// attach listeners for real-time updates
+statusRef.on('child_added', snap => { const val = snap.val() || {}; handleStatusChange(snap.key, val); });
+statusRef.on('child_changed', snap => { const val = snap.val() || {}; handleStatusChange(snap.key, val); });
+// optional: handle child_removed -> stop any jobs for that id
+statusRef.on('child_removed', snap => { log('[db-watch] status child removed for', snap.key); if (jobs.has(snap.key)) stopJobFor(snap.key); });
+
+// run initial scan once
+initialStatusScan().catch(e => errlog('[init-scan] error', e && e.message));
+
+/* ---------- health / cleanup ---------- */
 const healthInterval = setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) { try { ws.terminate(); } catch (e) {} ; return; }
@@ -433,17 +467,17 @@ const healthInterval = setInterval(() => {
   });
 }, 30000);
 
-/* -------------------- HTTP admin API -------------------- */
+/* ---------- HTTP admin API ---------- */
 const app = express();
 app.use(bodyParser.json());
 app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/connected', (req, res) => { const keys = Array.from(clients.keys()); log('[http] /connected ->', keys.length); res.json({ connected: keys }); });
 app.post('/trigger-revive', async (req, res) => {
   const deviceId = req.body.deviceId; if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-  try { const snap = await statusRef.child(deviceId).once('value'); const val = snap.val() || {}; log('[http] trigger-revive for', deviceId); await startJobFor(deviceId, { timestamp: val.timestamp || 0, fcmToken: await getFcmTokenForDevice(deviceId) }); return res.json({ started: true }); }
+  try { const snap = await statusRef.child(deviceId).once('value'); const val = snap.val() || {}; log('[http] trigger-revive for', deviceId); const token = await getFcmTokenForDevice(deviceId); await startJobFor(deviceId, { timestamp: val.timestamp || 0, fcmToken: token }); return res.json({ started: true }); }
   catch (e) { errlog('[http] trigger-revive error', e && e.message); return res.status(500).json({ error: String(e) }); }
 });
-app.post('/stop-revive', (req, res) => { const deviceId = req.body.deviceId; if (!deviceId) return res.status(400).json({ error: 'deviceId required' }); stopJobFor(deviceId); return res.json({ stopped: true }); });
+app.post('/stop-revive', (req, res) => { const deviceId = req.body.deviceId; if (!deviceId) return res.status(400).json({ error: 'deviceId required' }); log('[http] stop-revive for', deviceId); stopJobFor(deviceId); return res.json({ stopped: true }); });
 const httpServer = app.listen(HTTP_PORT, () => log('[http] admin API running on', HTTP_PORT));
 
 process.on('SIGINT', () => {
