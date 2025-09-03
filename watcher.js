@@ -5,7 +5,7 @@ const PID_FILE = process.env.PID_FILE || path.join(process.cwd(), 'server.pid');
 const LAST_LOG_TS_FILE = process.env.LAST_LOG_TS_FILE || path.join(process.cwd(), 'last_log_ts');
 const LOG_FILE = process.env.SERVER_LOG_FILE || path.join(process.cwd(), 'server.log');
 
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || process.env.WATCHER_CHECK_INTERVAL_MS || '15000', 10);
+const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || process.env.WATCHER_CHECK_INTERVAL_MS || '5000', 10);
 const LOG_STALL_THRESHOLD_MS = parseInt(process.env.WATCHER_THRESHOLD_MS || process.env.LOG_WATCHER_THRESHOLD_MS || process.env.LOG_STALL_THRESHOLD_MS || '60000', 10);
 const KILL_TIMEOUT_MS = parseInt(process.env.KILL_TIMEOUT_MS || '5000', 10);
 const STATUS_HEARTBEAT_MS = parseInt(process.env.STATUS_HEARTBEAT_MS || '5000', 10);
@@ -118,9 +118,7 @@ function pollTail(){
   }
 }
 
-setInterval(()=>{
-  pollTail();
-}, Math.max(200, TAIL_POLL_MS));
+setInterval(()=>{ pollTail(); }, Math.max(200, TAIL_POLL_MS));
 
 setInterval(()=>{
   try {
