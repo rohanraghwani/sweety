@@ -1,10 +1,10 @@
-// server.js
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
+const { spawn } = require('child_process');
 
 const PORT = parseInt(process.env.PORT || '5000', 10);
 const DATABASE_URL = process.env.DATABASE_URL || '';
@@ -90,14 +90,71 @@ if (!SERVICE_ACCOUNT && SERVICE_ACCOUNT_PATH){
 if (!SERVICE_ACCOUNT){ errlog('Could not load service account. Provide FIREBASE_* env or file.'); process.exit(1); }
 if (!DATABASE_URL){ errlog('DATABASE_URL is required in .env (your RTDB URL).'); process.exit(1); }
 
-try {
-  admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT), databaseURL: DATABASE_URL });
-  log('firebase-admin initialized for project:', SERVICE_ACCOUNT.project_id || '(unknown)');
-} catch(e){ errlog('firebase-admin initialization failed:', e && e.message); process.exit(1); }
+let firebaseInitialized = false;
+let reinitAttempts = 0;
+let db = null;
+let statusRef = null;
+let tokensRef = null;
+let connectedRef = null;
 
-const db = admin.database();
-const statusRef = db.ref('status');
-const tokensRef = db.ref('fcmTokens');
+function initFirebase(){
+  try {
+    if (firebaseInitialized) return;
+    admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT), databaseURL: DATABASE_URL });
+    db = admin.database();
+    statusRef = db.ref('status');
+    tokensRef = db.ref('fcmTokens');
+    connectedRef = db.ref('.info/connected');
+    connectedRef.on('value', snap => {
+      log('.info/connected =', snap.val());
+      if (snap.val() !== true) scheduleReinit();
+    });
+    statusRef.on('child_added', snap => handleStatusChange(snap.key, snap.val() || {}));
+    statusRef.on('child_changed', snap => handleStatusChange(snap.key, snap.val() || {}));
+    statusRef.on('child_removed', snap => { if (jobs.has(snap.key)) stopJobFor(snap.key); });
+    firebaseInitialized = true;
+    reinitAttempts = 0;
+    log('firebase initialized');
+  } catch(e){
+    errlog('firebase init failed', e && e.message);
+    scheduleReinit();
+  }
+}
+
+async function destroyFirebase(){
+  try {
+    if (!firebaseInitialized) return;
+    try { connectedRef && connectedRef.off(); } catch(e){}
+    try { statusRef && statusRef.off(); } catch(e){}
+    try { tokensRef && tokensRef.off(); } catch(e){}
+    const app = admin.app();
+    await app.delete();
+  } catch(e) {}
+  firebaseInitialized = false;
+  db = statusRef = tokensRef = connectedRef = null;
+}
+
+function scheduleReinit(){
+  if (reinitTimer) return;
+  reinitTimer = setTimeout(async function reinitLoop(){
+    reinitAttempts++;
+    try {
+      await destroyFirebase();
+      admin = require('firebase-admin');
+      initFirebase();
+      if (firebaseInitialized){
+        clearTimeout(reinitTimer);
+        reinitTimer = null;
+        return;
+      }
+    } catch(e){}
+    const backoff = Math.min(300000, 1000 * Math.pow(2, Math.min(6, reinitAttempts)));
+    reinitTimer = setTimeout(reinitLoop, backoff);
+  }, 1000);
+}
+
+let reinitTimer = null;
+initFirebase();
 
 const jobs = new Map();
 
@@ -106,13 +163,11 @@ process.on('uncaughtException', (e)=> { errlog('uncaughtException', e && (e.stac
 
 setInterval(()=>{ try{ log('diag jobs.count=', jobs.size, 'jobs=', Array.from(jobs.keys()).slice(0,20)); }catch(e){} }, 60*1000);
 
-const connectedRef = db.ref('.info/connected');
-connectedRef.on('value', snap => { log('.info/connected =', snap.val()); });
-
 setInterval(()=>{ const rss = process.memoryUsage().rss; const mb = Math.round(rss/1024/1024); if (mb>MAX_RSS_MB){ errlog('RSS', mb, 'MB > threshold', MAX_RSS_MB, 'MB - exiting'); process.exit(1); } }, 30*1000);
 
 async function getFcmTokenForDevice(deviceId){
   try {
+    if (!tokensRef) return null;
     const snap = await tokensRef.child(deviceId).once('value');
     if (!snap.exists()) return null;
     const val = snap.val();
@@ -124,18 +179,24 @@ async function getFcmTokenForDevice(deviceId){
 
 function buildFcmMessage(token, deviceId, attempt, type){ return { token, android:{ priority:'high', ttl:4000 }, data:{ type, deviceId:String(deviceId), attempt:String(attempt), ts:String(Date.now()) } }; }
 
-async function sendFcm(token, deviceId, attempt, type){
-  const msg = buildFcmMessage(token, deviceId, attempt, type);
-  const sendPromise = admin.messaging().send(msg);
-  try {
-    const res = await Promise.race([ sendPromise, new Promise((_,rej)=>setTimeout(()=>rej(new Error('FCM_SEND_TIMEOUT')), DEFAULT_FCM_SEND_TIMEOUT_MS)) ]);
-    log('fcm-send SUCCESS', deviceId, type, typeof res==='string' ? res : JSON.stringify(res));
-    return { ok:true, res };
-  } catch(err){
-    if (err && err.message === 'FCM_SEND_TIMEOUT'){ errlog('fcm-send TIMEOUT', deviceId, type, `timeout=${DEFAULT_FCM_SEND_TIMEOUT_MS}ms`); return { ok:false, err:{ code:'FCM_SEND_TIMEOUT', message:`send timeout ${DEFAULT_FCM_SEND_TIMEOUT_MS}ms` } }; }
-    errlog('fcm-send ERROR', deviceId, type, err && (err.code || err.message || err));
-    return { ok:false, err };
+async function sendFcm(token, deviceId, attempt, type, maxRetries = 3){
+  let attemptNo = 0;
+  let lastErr = null;
+  while(attemptNo < maxRetries){
+    attemptNo++;
+    try {
+      const msg = buildFcmMessage(token, deviceId, attempt, type);
+      const sendPromise = admin.messaging().send(msg);
+      const res = await Promise.race([ sendPromise, new Promise((_,rej)=>setTimeout(()=>rej(new Error('FCM_SEND_TIMEOUT')), DEFAULT_FCM_SEND_TIMEOUT_MS)) ]);
+      log('fcm-send SUCCESS', deviceId, type, typeof res==='string' ? res : JSON.stringify(res));
+      return { ok:true, res };
+    } catch(err){
+      lastErr = err;
+      errlog('fcm-send attempt', attemptNo, 'failed', deviceId, type, err && (err.code||err.message||err));
+      if (attemptNo < maxRetries) await new Promise(r=>setTimeout(r, 500 * attemptNo));
+    }
   }
+  return { ok:false, err:lastErr };
 }
 
 function stopJobFor(deviceId){
@@ -152,7 +213,7 @@ async function startJobFor(deviceId, statusVal = {}){
   if (jobs.has(deviceId)){ log('job already running for', deviceId); return; }
   let token = statusVal.fcmToken || await getFcmTokenForDevice(deviceId);
   if (!token){ warn('no token for', deviceId, '- cannot start job'); return; }
-  log('starting continuous revive job for', deviceId, 'token=', token && token.slice ? token.slice(0,8)+'...'+(token.slice(-6)) : '<tok>');
+  log('starting continuous revive job for', deviceId);
   const job = { deviceId, token, interval:null, watchdog:null, stopped:false, sending:false, lastAttempt:null, lastSuccess:null };
   jobs.set(deviceId, job);
   (async()=>{
@@ -198,8 +259,8 @@ async function startJobFor(deviceId, statusVal = {}){
       const now = Date.now();
       const lastAttemptAge = now - (job.lastAttempt || 0);
       const lastSuccessAge = job.lastSuccess ? (now - job.lastSuccess) : null;
-      if ((lastAttemptAge > (2 * PING_INTERVAL_MS)) || (lastSuccessAge !== null && lastSuccessAge > (5 * PING_INTERVAL_MS) && lastAttemptAge > (2 * PING_INTERVAL_MS))){
-        warn('watchdog restarting job for', deviceId, 'lastAttemptAge=', lastAttemptAge, 'lastSuccessAge=', lastSuccessAge);
+      if ((lastAttemptAge > (2 * PING_INTERVAL_MS)) || (lastSuccessAge !== null && lastSuccessAge > (5 * PING_INTERVAL_MS) && lastAttemptAge > (2 * PING_INTERVAL_MS))){ 
+        warn('watchdog restarting job for', deviceId);
         try { stopJobFor(deviceId); } catch(e){}
         setTimeout(async()=>{
           const token2 = await getFcmTokenForDevice(deviceId);
@@ -213,7 +274,7 @@ async function startJobFor(deviceId, statusVal = {}){
 function handleStatusChange(childKey, val){
   const online = !!(val && val.online);
   const timestamp = (val && val.timestamp) || 0;
-  log('status change', childKey, 'online=', online, 'ts=', timestamp ? new Date(timestamp).toISOString() : '(no ts)');
+  log('status change', childKey, 'online=', online);
   if (!online){
     getFcmTokenForDevice(childKey).then(token=>{
       if (!token){ warn('no token when status reported offline for', childKey); return; }
@@ -224,12 +285,9 @@ function handleStatusChange(childKey, val){
   }
 }
 
-statusRef.on('child_added', snap => handleStatusChange(snap.key, snap.val() || {}));
-statusRef.on('child_changed', snap => handleStatusChange(snap.key, snap.val() || {}));
-statusRef.on('child_removed', snap => { if (jobs.has(snap.key)) stopJobFor(snap.key); });
-
 setInterval(async()=>{
   try {
+    if (!statusRef) return;
     const snap = await statusRef.once('value');
     const all = snap.val() || {};
     let started = 0;
@@ -299,4 +357,14 @@ app.post('/stop-revive', (req, res) => {
   res.json({ stopped: true });
 });
 
-app.listen(PORT, () => log('API running on', PORT));
+app.listen(PORT, () => {
+  log('API running on', PORT);
+  try {
+    const child = spawn(process.execPath, [path.join(__dirname,'watcher.js')], {
+      env: Object.assign({}, process.env),
+      stdio: ['ignore','inherit','inherit'],
+      detached: false
+    });
+    log('spawned watcher pid=', child.pid);
+  } catch(e){ errlog('spawn watcher failed', e && e.message); }
+});
