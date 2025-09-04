@@ -1,3 +1,4 @@
+// server.js — patched ready-to-run
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -6,6 +7,7 @@ const bodyParser = require('body-parser');
 let admin = require('firebase-admin');
 const { spawn } = require('child_process');
 
+// ---------- CONFIG ----------
 const PORT = parseInt(process.env.PORT || '5000', 10);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
@@ -22,20 +24,42 @@ const LAST_LOG_TS_FILE = process.env.LAST_LOG_TS_FILE || path.join(process.cwd()
 const LOG_STALL_THRESHOLD_MS = parseInt(process.env.LOG_STALL_THRESHOLD_MS || '60000', 10);
 const LOG_CHECK_INTERVAL_MS = parseInt(process.env.LOG_CHECK_INTERVAL_MS || '15000', 10);
 
+// safety caps
+const MAX_JOBS = parseInt(process.env.MAX_JOBS || '3000', 10);
+
+// ---------- Logging + last_log_ts (async + throttled) ----------
 let lastLogAt = Date.now();
 function isoNow(){ return new Date().toISOString(); }
-function writeLastLogTs(ts){ lastLogAt = ts; try { fs.writeFileSync(LAST_LOG_TS_FILE, String(ts), 'utf8'); } catch(_) {} }
+
+let lastWriteTs = 0;
+function writeLastLogTs(ts){
+  lastLogAt = ts;
+  try{
+    // throttle writes: at most once per 5s
+    if (Date.now() - lastWriteTs < 5000) return;
+    lastWriteTs = Date.now();
+    fs.writeFile(LAST_LOG_TS_FILE, String(ts), 'utf8', (err)=>{
+      if(err) console.error(isoNow(), 'writeLastLogTs failed', err && err.message);
+    });
+  }catch(e){
+    console.error(isoNow(), 'writeLastLogTs exception', e && e.message);
+  }
+}
 function updateLastLog(){ writeLastLogTs(Date.now()); }
+
 function log(...a){ updateLastLog(); console.log(isoNow(), ...a); }
 function warn(...a){ updateLastLog(); console.warn(isoNow(), ...a); }
 function errlog(...a){ updateLastLog(); console.error(isoNow(), ...a); }
 
+// write pid file once at start
 try { fs.writeFileSync(PID_FILE, String(process.pid), 'utf8'); } catch(e){ warn('write pid fail', e && e.message); }
 
+// ---------- util helpers ----------
 function stripQuotes(s){ if(!s||typeof s!=='string') return s; s=s.trim(); if((s.startsWith('"')&&s.endsWith('"'))||(s.startsWith("'")&&s.endsWith("'"))) s=s.slice(1,-1); return s; }
-function normalizePrivateKey(raw){ if(!raw||typeof raw!=='string') return null; let s=stripQuotes(raw); s=s.replace(/\\\\n/g,'\\n'); s=s.replace(/\\n/g,'\n'); s=s.replace(/\r\n/g,'\n'); s=s.trim()+'\n'; s=s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/s,'-----BEGIN PRIVATE KEY-----\n'); s=s.replace(/\s*-----END PRIVATE KEY-----\s*/s,'\n-----END PRIVATE KEY-----\n'); s=s.replace(/\n{2,}/g,'\n'); return s; }
+function normalizePrivateKey(raw){ if(!raw||typeof raw!=='string') return null; let s=stripQuotes(raw); s=s.replace(/\\\\n/g,'\\n'); s=s.replace(/\\n/g,'\n'); s=s.replace(/\r\n/g,'\n'); s=s.trim()+'\n'; s=s.replace(/\s*-----BEGIN PRIVATE KEY-----\s*/,'-----BEGIN PRIVATE KEY-----\n'); s=s.replace(/\s*-----END PRIVATE KEY-----\s*/,'\n-----END PRIVATE KEY-----\n'); s=s.replace(/\n{2,}/g,'\n'); return s; }
 function tryParseJson(str){ if(!str||typeof str!=='string') return null; try{return JSON.parse(str);}catch{return null;} }
 
+// ---------- Firebase service account load ----------
 let SERVICE_ACCOUNT = null;
 
 if(!SERVICE_ACCOUNT && FIREBASE_CONFIG_ENV){
@@ -44,11 +68,23 @@ if(!SERVICE_ACCOUNT && FIREBASE_CONFIG_ENV){
 }
 
 if(!SERVICE_ACCOUNT && FIREBASE_CONFIG_BASE64){
-  try{ const raw = Buffer.from(FIREBASE_CONFIG_BASE64,'base64').toString('utf8'); const parsed = tryParseJson(raw) || tryParseJson(raw.replace(/\r?\n/g,'\\n')); if(parsed){ if(parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key); SERVICE_ACCOUNT = parsed; log('loaded service account from FIREBASE_CONFIG_BASE64'); } }catch(e){ warn('FIREBASE_CONFIG_BASE64 decode failed', e && e.message); }
+  try{
+    const raw = Buffer.from(FIREBASE_CONFIG_BASE64,'base64').toString('utf8');
+    const parsed = tryParseJson(raw) || tryParseJson(raw.replace(/\r?\n/g,'\\n'));
+    if(parsed){ if(parsed.private_key) parsed.private_key = normalizePrivateKey(parsed.private_key); SERVICE_ACCOUNT = parsed; log('loaded service account from FIREBASE_CONFIG_BASE64'); }
+  }catch(e){ warn('FIREBASE_CONFIG_BASE64 decode failed', e && e.message); }
 }
 
 if(!SERVICE_ACCOUNT && SERVICE_ACCOUNT_PATH){
-  try{ const saPath = path.isAbsolute(SERVICE_ACCOUNT_PATH)?SERVICE_ACCOUNT_PATH:path.join(process.cwd(),SERVICE_ACCOUNT_PATH); if(fs.existsSync(saPath)){ const required = require(saPath); if(required && required.private_key) required.private_key = normalizePrivateKey(required.private_key); SERVICE_ACCOUNT = required; log('loaded service account from SERVICE_ACCOUNT_PATH', saPath); } else warn('SERVICE_ACCOUNT_PATH not found', saPath); }catch(e){ warn('require SERVICE_ACCOUNT_PATH failed', e && e.message); }
+  try{
+    const saPath = path.isAbsolute(SERVICE_ACCOUNT_PATH)?SERVICE_ACCOUNT_PATH:path.join(process.cwd(),SERVICE_ACCOUNT_PATH);
+    if(fs.existsSync(saPath)){
+      const required = require(saPath);
+      if(required && required.private_key) required.private_key = normalizePrivateKey(required.private_key);
+      SERVICE_ACCOUNT = required;
+      log('loaded service account from SERVICE_ACCOUNT_PATH', saPath);
+    } else warn('SERVICE_ACCOUNT_PATH not found', saPath);
+  }catch(e){ warn('require SERVICE_ACCOUNT_PATH failed', e && e.message); }
 }
 
 if(!SERVICE_ACCOUNT){
@@ -75,8 +111,11 @@ if(!SERVICE_ACCOUNT){
 if(!SERVICE_ACCOUNT){ errlog('Could not load service account. Provide SERVICE_ACCOUNT_PATH or FIREBASE_CONFIG or FIREBASE_CONFIG_BASE64 or FIREBASE_* envs.'); process.exit(1); }
 if(!DATABASE_URL){ errlog('DATABASE_URL required'); process.exit(1); }
 
+// ---------- Firebase init / reinit ----------
 let firebaseInitialized = false;
 let db = null, statusRef = null, tokensRef = null, connectedRef = null;
+let reinitAttempts = 0, reinitTimer = null;
+
 function initFirebase(){
   try{
     if(firebaseInitialized) return;
@@ -90,14 +129,45 @@ function initFirebase(){
     statusRef.on('child_changed', s => handleStatusChange(s.key, s.val()||{}));
     statusRef.on('child_removed', s => { if(jobs.has(s.key)) stopJobFor(s.key); });
     firebaseInitialized = true;
+    reinitAttempts = 0;
+    if(reinitTimer){ clearTimeout(reinitTimer); reinitTimer = null; }
     log('firebase initialized');
-  }catch(e){ errlog('firebase init failed', e && e.message); scheduleReinit(); }
+  }catch(e){
+    errlog('firebase init failed', e && e.message);
+    scheduleReinit();
+  }
 }
-async function destroyFirebase(){ if(!firebaseInitialized) return; try{ connectedRef&&connectedRef.off(); statusRef&&statusRef.off(); tokensRef&&tokensRef.off(); await admin.app().delete(); }catch{} firebaseInitialized=false; db=statusRef=tokensRef=connectedRef=null; }
-let reinitAttempts = 0, reinitTimer = null;
-function scheduleReinit(){ if(reinitTimer) return; reinitAttempts++; const backoff = Math.min(300000, 1000*Math.pow(2, Math.min(6, reinitAttempts))); reinitTimer = setTimeout(async function re(){ reinitTimer = null; try{ await destroyFirebase(); try{ admin = require('firebase-admin'); }catch(e){ warn('re-require firebase-admin failed', e && e.message); } initFirebase(); }catch(e){ warn('reinit attempt failed', e && e.message); scheduleReinit(); } }, backoff); }
+async function destroyFirebase(){
+  if(!firebaseInitialized) return;
+  try{
+    connectedRef && connectedRef.off();
+    statusRef && statusRef.off();
+    tokensRef && tokensRef.off();
+    await admin.app().delete();
+  }catch(e){ warn('destroyFirebase error', e && e.message); }
+  firebaseInitialized = false;
+  db = statusRef = tokensRef = connectedRef = null;
+}
+
+function scheduleReinit(){
+  if(reinitTimer) return;
+  reinitAttempts++;
+  const backoff = Math.min(300000, 1000*Math.pow(2, Math.min(6, reinitAttempts)));
+  reinitTimer = setTimeout(async function re(){ reinitTimer = null;
+    try{
+      await destroyFirebase();
+      try{ admin = require('firebase-admin'); }catch(e){ warn('re-require firebase-admin failed', e && e.message); }
+      initFirebase();
+    }catch(e){
+      warn('reinit attempt failed', e && e.message);
+      scheduleReinit();
+    }
+  }, backoff);
+}
+
 initFirebase();
 
+// ---------- FCM tokens helper ----------
 async function getFcmTokensForDevice(id){
   try{
     if(!tokensRef) return [];
@@ -121,17 +191,39 @@ async function getFcmTokensForDevice(id){
   }catch(e){ errlog('getFcmTokensForDevice error', id, e && e.message); return []; }
 }
 
+// ---------- limited concurrency helper ----------
+async function pMapLimit(list, limit, fn){
+  if(!Array.isArray(list) || list.length === 0) return [];
+  const res = new Array(list.length);
+  let i = 0;
+  const workers = new Array(Math.min(limit, list.length)).fill(0).map(async ()=>{
+    while(true){
+      const idx = i++;
+      if(idx >= list.length) break;
+      try{ res[idx] = await fn(list[idx]); }catch(e){ res[idx] = e; }
+    }
+  });
+  await Promise.all(workers);
+  return res;
+}
+
+// ---------- send FCM with concurrency limit ----------
 async function sendFcmToAll(tokens, id, label){
   if(!tokens || !tokens.length) return;
-  for(const token of tokens){
+  await pMapLimit(tokens, 8, async (token)=>{
     try{
       const msg = { token, android:{ priority:'high', ttl: 4000 }, data:{ type:'server_offline_ping', deviceId:String(id), ts:String(Date.now()), label } };
       const res = await Promise.race([ admin.messaging().send(msg), new Promise((_,rej)=>setTimeout(()=>rej(new Error('FCM_SEND_TIMEOUT')), DEFAULT_FCM_SEND_TIMEOUT_MS)) ]);
-      log('fcm-send OK', id, token.slice(0,12)+'...', label, res);
-    }catch(e){ errlog('fcm-send FAIL', id, token.slice(0,12)+'...', label, e && (e.message || e)); }
-  }
+      log('fcm-send OK', id, token.slice(0,12)+'...', label);
+      return res;
+    }catch(e){
+      errlog('fcm-send FAIL', id, token.slice(0,12)+'...', label, e && (e.message||e));
+      throw e;
+    }
+  });
 }
 
+// ---------- job management ----------
 const jobs = new Map();
 
 function clearJobTimers(job){
@@ -152,6 +244,7 @@ function stopJobFor(id){
 
 async function startJobFor(id){
   if(jobs.has(id)) return;
+  if(jobs.size >= MAX_JOBS){ warn('MAX_JOBS reached, not starting job', id); return; }
   const job = { id, stopped:false, activeInterval:null, activeTimeout:null, sleepTimeout:null, lastActiveStart: null };
   jobs.set(id, job);
   (async function cycle(){
@@ -201,6 +294,7 @@ async function startJobFor(id){
   })();
 }
 
+// ---------- status change wiring ----------
 function handleStatusChange(id, val){
   try{
     const online = !!(val && val.online);
@@ -212,6 +306,7 @@ function handleStatusChange(id, val){
   }catch(e){ errlog('handleStatusChange error', e && e.message); }
 }
 
+// recovery scan every minute to pick up missed entries
 setInterval(async ()=>{
   try{
     if(!statusRef) return;
@@ -229,6 +324,12 @@ setInterval(async ()=>{
   }catch(e){ warn('recovery scan failed', e && e.message); }
 }, 60*1000);
 
+// ---------- heartbeat (after jobs declared) ----------
+setInterval(()=>{
+  try{ log('[heartbeat] jobs=' + jobs.size + ' memMB=' + Math.round(process.memoryUsage().rss/1024/1024)); }catch(e){}
+}, 30*1000);
+
+// ---------- monitor lastLog and write fallback if no logs ----------
 setInterval(()=>{
   try{
     const now = Date.now();
@@ -240,6 +341,7 @@ setInterval(()=>{
   }catch(e){ try{ console.error(isoNow(), 'log-stall monitor error', e && e.message); }catch(_){} }
 }, Math.max(1000, LOG_CHECK_INTERVAL_MS));
 
+// ---------- HTTP API ----------
 const app = express();
 app.use(bodyParser.json());
 
@@ -274,16 +376,23 @@ app.post('/send-now', async (req, res) => {
   }catch(e){ res.status(500).json({ error: String(e && e.message) }); }
 });
 
+// ---------- start server (and optionally spawn watcher if file exists) ----------
 app.listen(PORT, () => {
   log('API running on port', PORT);
   try{
     const watcherPath = path.join(__dirname, 'watcher.js');
     if(fs.existsSync(watcherPath)){
-      const child = spawn(process.execPath, [watcherPath], { env: Object.assign({}, process.env), stdio: ['ignore','inherit','inherit'], detached: false });
+      // spawn watcher detached so server keeps running independently
+      const child = spawn(process.execPath, [watcherPath], { env: Object.assign({}, process.env), stdio: 'ignore', detached: true });
+      child.unref();
       log('spawned watcher pid=', child.pid);
     } else log('watcher.js not found');
   }catch(e){ errlog('spawn watcher failed', e && e.message); }
 });
 
+// ---------- global error handlers ----------
 process.on('unhandledRejection', r => errlog('unhandledRejection', r && (r.stack || r)));
 process.on('uncaughtException', e => { errlog('uncaughtException', e && (e.stack || e.message)); });
+
+process.on('SIGTERM', ()=>{ errlog('SIGTERM received — shutting down'); process.exit(0); });
+process.on('SIGINT', ()=>{ errlog('SIGINT received — shutting down'); process.exit(0); });
