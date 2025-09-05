@@ -13,7 +13,6 @@ const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || '';
 const FIREBASE_CONFIG_ENV = process.env.FIREBASE_CONFIG || '';
 const FIREBASE_CONFIG_BASE64 = process.env.FIREBASE_CONFIG_BASE64 || '';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
-const RETRY_LIMIT = parseInt(process.env.RETRY_LIMIT || '5', 10);
 const RETRY_GAP_MS = parseInt(process.env.RETRY_GAP_MS || '2000', 10);
 const MESSAGE_TTL_MS = parseInt(process.env.MESSAGE_TTL_MS || String(5 * 60 * 1000), 10);
 const DEFAULT_FCM_SEND_TIMEOUT_MS = parseInt(process.env.DEFAULT_FCM_SEND_TIMEOUT_MS || '8000', 10);
@@ -142,10 +141,16 @@ async function jobCycle(deviceId){
   if(jobs.has(deviceId)) return;
   const job = { deviceId, attempt: 0, stopped: false, timer: null };
   jobs.set(deviceId, job);
+
   const runAttempt = async () => {
     if(job.stopped) return;
+
     const s = await statusRef.child(deviceId).once('value').then(x=>x.val()||{}).catch(()=>({}));
-    if(s.online === true){ stopJob(deviceId); return; }
+    if(s.online === true){ 
+      stopJob(deviceId); 
+      return; 
+    }
+
     const tokens = await getFcmTokensForDevice(deviceId);
     if(tokens.length){
       const expiryTs = Date.now() + MESSAGE_TTL_MS;
@@ -167,10 +172,13 @@ async function jobCycle(deviceId){
     } else {
       warn('no tokens', deviceId);
     }
+
     job.attempt += 1;
-    if(job.attempt >= RETRY_LIMIT){ stopJob(deviceId); return; }
-    job.timer = setTimeout(runAttempt, RETRY_GAP_MS);
+    if(!job.stopped){
+      job.timer = setTimeout(runAttempt, RETRY_GAP_MS); // 🔁 infinite retries
+    }
   };
+
   job.timer = setTimeout(runAttempt, 0);
 }
 
