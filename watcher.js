@@ -1,4 +1,4 @@
-// watcher.js — monitor + restart + tail
+// watcher.js — monitor + restart + tail (fixed)
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -26,6 +26,10 @@ function readNumberFile(filePath){
     console.error(isoNow(), 'read error', filePath, e && e.message);
     return null;
   }
+}
+
+function isProcessAlive(pid){
+  try { process.kill(pid, 0); return true; } catch(e){ return false; }
 }
 
 function killPid(pid, signal){
@@ -65,23 +69,30 @@ async function checkOnce(){
 
   console.log(isoNow(), `pid=${pid || 'NONE'} lastLogAgeMs=${age === Infinity ? 'NEVER' : age} threshold=${LOG_STALL_THRESHOLD_MS}`);
 
+  // If server process missing, try spawn
+  if (!pid || !isProcessAlive(pid)) {
+    console.warn(isoNow(), `server missing (pid=${pid||'NONE'}). spawning server.`);
+    await spawnServer();
+    return;
+  }
+
+  // If logs stale beyond threshold -> restart flow
   if (age > LOG_STALL_THRESHOLD_MS) {
-    console.error(isoNow(), `detected log-stall age ${age}ms > threshold ${LOG_STALL_THRESHOLD_MS}ms. restarting pid ${pid || 'UNKNOWN'}`);
-    if (pid && killPid(pid, 'SIGTERM')) {
+    console.error(isoNow(), `detected log-stall age ${age}ms > threshold ${LOG_STALL_THRESHOLD_MS}ms. restarting pid ${pid}`);
+    // Try graceful
+    if (killPid(pid, 'SIGTERM')) {
       await new Promise(res => setTimeout(res, KILL_TIMEOUT_MS));
-      let alive = true;
-      try { process.kill(pid, 0); } catch(e){ alive = false; }
-      if (alive) {
+      if (isProcessAlive(pid)) {
         console.warn(isoNow(), `pid ${pid} alive after SIGTERM -> SIGKILL`);
         killPid(pid, 'SIGKILL');
-        await new Promise(res => setTimeout(res, 100));
+        // give short time for OS to reap
+        await new Promise(res => setTimeout(res, 200));
       } else {
-        console.log(isoNow(), `pid ${pid} no longer exists after SIGTERM`);
+        console.log(isoNow(), `pid ${pid} exited after SIGTERM`);
       }
     } else {
-      console.error(isoNow(), `couldn't send SIGTERM to pid ${pid || 'UNKNOWN'}`);
+      console.error(isoNow(), `couldn't send SIGTERM to pid ${pid}`);
     }
-
     // spawn new server
     await spawnServer();
   }
@@ -89,14 +100,18 @@ async function checkOnce(){
 
 console.log(isoNow(), 'watcher starting CHECK_INTERVAL_MS=', CHECK_INTERVAL_MS, 'LOG_STALL_THRESHOLD_MS=', LOG_STALL_THRESHOLD_MS, 'LOG_FILE=', LOG_FILE, 'SERVER_PATH=', SERVER_PATH);
 
-// initial spawn if no pid or process missing
+// ensure server running at start
 (async ()=>{
-  const pid = readNumberFile(PID_FILE);
-  if(!pid){
-    console.log(isoNow(), 'no pid found — spawning server');
-    await spawnServer();
-  } else {
-    try { process.kill(pid, 0); console.log(isoNow(), 'server pid exists:', pid); } catch(e){ console.log(isoNow(), 'pid not running — spawning server'); await spawnServer(); }
+  try {
+    const pid = readNumberFile(PID_FILE);
+    if(!pid || !isProcessAlive(pid)){
+      console.log(isoNow(), 'no running pid found — spawning server');
+      await spawnServer();
+    } else {
+      console.log(isoNow(), 'server pid exists:', pid);
+    }
+  } catch(e) {
+    console.error(isoNow(), 'initial spawn check failed', e && e.stack || e);
   }
 })();
 
@@ -104,7 +119,7 @@ console.log(isoNow(), 'watcher starting CHECK_INTERVAL_MS=', CHECK_INTERVAL_MS, 
 setInterval(()=>{ checkOnce().catch(e => console.error(isoNow(), 'unexpected error', e && e.stack || e)); }, Math.max(1000, CHECK_INTERVAL_MS));
 checkOnce().catch(e => console.error(isoNow(), 'initial check error', e && e.stack || e));
 
-// --- tail logic (optional) ---
+// --- tail logic (optional, safe) ---
 let tailPos = 0;
 let tailFd = null;
 function openTail(){
@@ -144,3 +159,7 @@ function pollTail(){
   }
 }
 setInterval(()=>{ pollTail(); }, Math.max(200, TAIL_POLL_MS));
+
+// handle graceful shutdown of watcher itself
+process.on('SIGINT', ()=>{ console.log(isoNow(), 'watcher SIGINT — exiting'); process.exit(0); });
+process.on('SIGTERM', ()=>{ console.log(isoNow(), 'watcher SIGTERM — exiting'); process.exit(0); });
